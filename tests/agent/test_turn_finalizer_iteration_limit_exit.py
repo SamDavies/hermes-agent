@@ -46,6 +46,7 @@ class _LimitAgent:
         self.persisted_messages = None
         self._handle_max_iterations_called = False
         self._completion_explainer = completion_explainer
+        self._kanban_task_id = None
 
     def _handle_max_iterations(self, messages, api_call_count):
         self._handle_max_iterations_called = True
@@ -275,6 +276,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
     monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
     agent = _LimitAgent()
+    agent._kanban_task_id = "task-123"
 
     result = _finalize(
         agent,
@@ -296,6 +298,24 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_taskless_subagent_timeout_does_not_fail_parent_card(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-parent")
+    record = MagicMock(name="record_task_failure")
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="child evidence",
+    )
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    record.assert_not_called()
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):

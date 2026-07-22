@@ -1004,6 +1004,12 @@ Roles:
   own workers. Gated by `delegation.orchestrator_enabled` (default true)
   and bounded by `delegation.max_spawn_depth` (default 2).
 
+Kanban lifecycle ownership stays with the top-level worker that received the
+dispatcher task. Delegated leaves and delegated orchestrators run in a taskless
+scope with project implementation tools and return their results to their
+parent. The parent supplies board guidance, automatic heartbeats, and the
+terminal completion or block handoff.
+
 Key config knobs (under `delegation:` in `config.yaml`):
 `max_concurrent_children`, `max_spawn_depth`, `child_timeout_seconds`,
 `orchestrator_enabled`, `subagent_auto_approve`, `inherit_mcp_toolsets`,

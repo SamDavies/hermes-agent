@@ -180,6 +180,27 @@ class TestLifecycle:
         s.close()
         assert client._closed is True
 
+    def test_child_environment_is_forwarded_to_client(self):
+        captured = {}
+        client = FakeClient()
+
+        def client_factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        env = {
+            "HERMES_KANBAN_TASK": None,
+            "HERMES_KANBAN_TASKLESS": "1",
+        }
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            env=env,
+            client_factory=client_factory,
+        )
+        session.ensure_started()
+
+        assert captured["env"] == env
+
 
 # ---- turn loop ----
 

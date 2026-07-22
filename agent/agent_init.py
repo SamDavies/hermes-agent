@@ -60,6 +60,9 @@ from utils import base_url_host_matches, is_truthy_value
 logger = logging.getLogger("run_agent")
 
 
+_KANBAN_TERMINAL_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so callers can patch
     ``run_agent.OpenAI`` / ``run_agent.cleanup_vm`` / ... and have those
@@ -755,6 +758,14 @@ def init_agent(
     agent.provider_data_collection = provider_data_collection
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
+    # Delegated children keep the parent's implementation tools while board
+    # lifecycle stays with that parent. Apply this at the agent boundary so
+    # every child role and transport receives the same tool authority.
+    if platform == "subagent":
+        disabled_toolsets = list(
+            dict.fromkeys(list(disabled_toolsets or []) + ["kanban"])
+        )
+
     # Store toolset filtering options
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
@@ -1366,15 +1377,23 @@ def init_agent(
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
 
-    # Kanban worker/orchestrator lifecycle guidance is session-static:
-    # the dispatcher decides at spawn time whether this process is a kanban
-    # worker (kanban_show tool is present iff HERMES_KANBAN_TASK is set).
-    # Resolving the ~835-token block once here avoids re-running the
-    # membership test + reference on every system-prompt rebuild
-    # (init + each context compression).
+    # Kanban worker lifecycle ownership is agent-local even though dispatcher
+    # identity arrives through a process-wide environment variable. A parent
+    # worker owns the lifecycle when its actual tool surface contains both
+    # terminal handoff tools. Delegated agents always return through that
+    # parent. Resolving this once keeps the prompt, stop guard, timeout
+    # finalizer, and automatic heartbeat on one capability boundary.
     from agent.prompt_builder import KANBAN_GUIDANCE
+    _candidate_kanban_task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    agent._kanban_task_id = (
+        _candidate_kanban_task
+        if platform != "subagent"
+        and _candidate_kanban_task
+        and _KANBAN_TERMINAL_TOOLS.issubset(agent.valid_tool_names)
+        else None
+    )
     agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
+        KANBAN_GUIDANCE if agent._kanban_task_id else ""
     )
 
     # Check tool requirements

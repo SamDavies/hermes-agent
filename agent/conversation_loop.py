@@ -5717,9 +5717,15 @@ def run_conversation(
                 try:
                     from agent.kanban_stop import build_kanban_stop_nudge
 
-                    _kanban_nudge = build_kanban_stop_nudge(
-                        messages=messages,
-                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                    _kanban_task_id = getattr(agent, "_kanban_task_id", None)
+                    _kanban_nudge = (
+                        build_kanban_stop_nudge(
+                            messages=messages,
+                            attempts=getattr(agent, "_kanban_stop_nudges", 0),
+                            task_id=_kanban_task_id,
+                        )
+                        if _kanban_task_id
+                        else None
                     )
                 except Exception:
                     logger.debug("kanban stop-loop check failed", exc_info=True)
@@ -5741,7 +5747,7 @@ def run_conversation(
                     logger.info(
                         "kanban stop-loop nudge issued (attempt %d) task=%s",
                         agent._kanban_stop_nudges,
-                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                        _kanban_task_id,
                     )
                     agent._emit_status(
                         "⚠️ Kanban worker tried to exit without "

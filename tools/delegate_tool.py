@@ -1175,7 +1175,12 @@ def _build_child_agent(
         ]
     child_disabled_toolsets = list(
         dict.fromkeys(
-            inherited_disabled + _blocked_toolsets_for_role(effective_role)
+            inherited_disabled
+            + _blocked_toolsets_for_role(effective_role)
+            # Delegated agents return results to their parent. The parent
+            # keeps ownership of any dispatcher-assigned Kanban lifecycle,
+            # including terminal handoff and automatic heartbeats.
+            + ["kanban"]
         )
     )
 
@@ -2001,11 +2006,17 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
-            return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
+            from agent.kanban_scope import (
+                is_taskless_kanban_agent,
+                taskless_kanban_scope,
             )
+
+            with taskless_kanban_scope(is_taskless_kanban_agent(child)):
+                return child.run_conversation(
+                    user_message=goal,
+                    task_id=child_task_id,
+                    stream_callback=_relay_child_text,
+                )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:

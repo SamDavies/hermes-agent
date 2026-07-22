@@ -557,7 +557,24 @@ class TestBridgeWiredInRuntime:
     a future refactor from dropping the bridge wiring and silently
     regressing Discord/Telegram live progress visibility."""
 
-    def test_session_constructor_receives_on_event(self, monkeypatch):
+    @pytest.mark.parametrize(
+        ("platform", "expected_env"),
+        [
+            (
+                "subagent",
+                {
+                    "HERMES_KANBAN_TASK": None,
+                    "HERMES_KANBAN_RUN_ID": None,
+                    "HERMES_KANBAN_CLAIM_LOCK": None,
+                    "HERMES_KANBAN_TASKLESS": "1",
+                },
+            ),
+            ("cli", None),
+        ],
+    )
+    def test_session_constructor_receives_on_event(
+        self, monkeypatch, platform, expected_env
+    ):
         from agent import codex_runtime
 
         captured: dict = {}
@@ -608,6 +625,7 @@ class TestBridgeWiredInRuntime:
             context_compressor=None,
             event_callback=None,
             _session_db=None,
+            platform=platform,
         )
 
         codex_runtime.run_codex_app_server_turn(
@@ -625,6 +643,7 @@ class TestBridgeWiredInRuntime:
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
         )
+        assert captured["env"] == expected_env
 
         # And the bridge must actually drive the agent's callbacks when
         # fed a representative notification.

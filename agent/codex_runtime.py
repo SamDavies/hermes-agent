@@ -670,6 +670,16 @@ def run_codex_app_server_turn(
                 exc_info=True,
             )
 
+        # Delegated agents keep the selected Codex runtime while their parent
+        # owns the dispatcher-assigned card and its terminal handoff.
+        codex_env = None
+        from agent.kanban_scope import (
+            is_taskless_kanban_agent,
+            taskless_kanban_subprocess_overrides,
+        )
+        if is_taskless_kanban_agent(agent):
+            codex_env = taskless_kanban_subprocess_overrides()
+
         # Bridge codex JSON-RPC notifications (item/started, item/completed,
         # item/agentMessage/delta, ...) into Hermes' gateway UI callbacks
         # (tool_progress_callback, _fire_stream_delta,
@@ -685,6 +695,7 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            env=codex_env,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the

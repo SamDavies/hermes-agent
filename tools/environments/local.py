@@ -485,6 +485,9 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
 
+    from agent.kanban_scope import apply_taskless_kanban_subprocess_env
+    apply_taskless_kanban_subprocess_env(sanitized)
+
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
 
@@ -611,6 +614,9 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+
+    from agent.kanban_scope import apply_taskless_kanban_subprocess_env
+    apply_taskless_kanban_subprocess_env(env)
 
     return env
 
@@ -1168,6 +1174,9 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+
+    from agent.kanban_scope import apply_taskless_kanban_subprocess_env
+    apply_taskless_kanban_subprocess_env(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

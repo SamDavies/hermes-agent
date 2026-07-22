@@ -296,6 +296,75 @@ class TestSpawnEnvIsolation:
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
 
+    def test_delegated_taskless_scope_has_no_parent_card_identity(
+        self, monkeypatch
+    ):
+        """A delegated Codex subprocess keeps the coding runtime while the
+        parent orchestrator retains its Kanban lifecycle and writable root.
+        """
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "parent-lock")
+        monkeypatch.setenv(
+            "HERMES_KANBAN_DB",
+            "/users/alice/.hermes/kanban/boards/main/kanban.db",
+        )
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "main")
+        monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", "/workspace/project")
+        monkeypatch.setenv("HERMES_KANBAN_BRANCH", "codex/fix")
+
+        from agent.kanban_scope import taskless_kanban_subprocess_overrides
+        client = cas.CodexAppServerClient(
+            codex_bin="codex",
+            env=taskless_kanban_subprocess_overrides(),
+        )
+        client._closed = True
+
+        assert "HERMES_KANBAN_TASK" not in captured["env"]
+        assert "HERMES_KANBAN_RUN_ID" not in captured["env"]
+        assert "HERMES_KANBAN_CLAIM_LOCK" not in captured["env"]
+        assert "HERMES_KANBAN_DB" not in captured["env"]
+        assert "HERMES_KANBAN_BOARD" not in captured["env"]
+        assert "HERMES_KANBAN_GOAL_MODE" not in captured["env"]
+        assert captured["env"]["HERMES_KANBAN_WORKSPACE"] == "/workspace/project"
+        assert captured["env"]["HERMES_KANBAN_BRANCH"] == "codex/fix"
+        assert captured["env"]["HERMES_KANBAN_TASKLESS"] == "1"
+        assert 'sandbox_mode="workspace-write"' in captured["cmd"]
+        assert "sandbox_workspace_write.network_access=false" in captured["cmd"]
+        assert all(
+            "sandbox_workspace_write.writable_roots" not in arg
+            for arg in captured["cmd"]
+        )
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(

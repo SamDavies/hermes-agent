@@ -235,6 +235,7 @@ class TestStripBlockedTools(unittest.TestCase):
             "clarify",
             "cronjob",
             "delegation",
+            "kanban",
             "memory",
         ):
             self.assertIn(toolset_name, disabled)
@@ -251,6 +252,95 @@ class TestStripBlockedTools(unittest.TestCase):
         names = {item["function"]["name"] for item in definitions}
         self.assertTrue(names & {"terminal", "read_file", "web_search"})
         self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
+
+    def test_parent_keeps_kanban_lifecycle_while_child_schema_is_taskless(self):
+        """A process-wide worker id scopes the parent, not its delegates."""
+        import model_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal"]
+        parent.disabled_toolsets = []
+
+        try:
+            with (
+                patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_parent"}),
+                patch("run_agent.AIAgent") as MockAgent,
+            ):
+                MockAgent.return_value = MagicMock()
+                invalidate_check_fn_cache()
+                model_tools._clear_tool_defs_cache()
+
+                parent_defs = model_tools.get_tool_definitions(
+                    enabled_toolsets=parent.enabled_toolsets,
+                    disabled_toolsets=parent.disabled_toolsets,
+                    quiet_mode=True,
+                )
+                parent_names = {
+                    item["function"]["name"] for item in parent_defs
+                }
+
+                _build_child_agent(
+                    task_index=0,
+                    goal="Inspect CI evidence",
+                    context=None,
+                    toolsets=None,
+                    model=None,
+                    max_iterations=10,
+                    parent_agent=parent,
+                    task_count=1,
+                    role="leaf",
+                )
+                _, child_kwargs = MockAgent.call_args
+                child_defs = model_tools.get_tool_definitions(
+                    enabled_toolsets=child_kwargs["enabled_toolsets"],
+                    disabled_toolsets=child_kwargs["disabled_toolsets"],
+                    quiet_mode=True,
+                )
+                child_names = {
+                    item["function"]["name"] for item in child_defs
+                }
+
+            self.assertTrue(
+                {"kanban_complete", "kanban_block"}.issubset(parent_names)
+            )
+            self.assertIn("kanban", child_kwargs["disabled_toolsets"])
+            self.assertFalse(
+                any(name.startswith("kanban_") for name in child_names)
+            )
+        finally:
+            invalidate_check_fn_cache()
+            model_tools._clear_tool_defs_cache()
+
+    def test_both_child_roles_use_taskless_subagent_identity(self):
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["terminal", "kanban"]
+        parent.disabled_toolsets = []
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+        ):
+            for role in ("leaf", "orchestrator"):
+                with self.subTest(role=role):
+                    mock_child = MagicMock()
+                    MockAgent.return_value = mock_child
+                    _build_child_agent(
+                        task_index=0,
+                        goal="Implement and report",
+                        context=None,
+                        toolsets=None,
+                        model=None,
+                        max_iterations=10,
+                        parent_agent=parent,
+                        task_count=1,
+                        role=role,
+                    )
+                    _, child_kwargs = MockAgent.call_args
+                    self.assertEqual(child_kwargs["platform"], "subagent")
+                    self.assertIn("kanban", child_kwargs["disabled_toolsets"])
+                    self.assertEqual(mock_child._delegate_role, role)
 
     def test_orchestrator_composite_regains_only_delegate_task(self):
         import model_tools
@@ -2097,6 +2187,51 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertEqual(result["status"], "error")
         child._credential_pool.release_lease.assert_called_once_with("cred-a")
+
+    def test_run_single_child_binds_taskless_subprocess_scope(self):
+        from tools.delegate_tool import _run_single_child
+        from tools.environments.local import hermes_subprocess_env
+
+        observed = {}
+        child = MagicMock()
+        child.platform = "subagent"
+        child._kanban_task_id = None
+
+        def run_conversation(**kwargs):
+            observed.update(hermes_subprocess_env(inherit_credentials=True))
+            return {
+                "final_response": "findings returned",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = run_conversation
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_KANBAN_TASK": "t_parent",
+                "HERMES_KANBAN_RUN_ID": "23",
+                "HERMES_KANBAN_DB": "/board/kanban.db",
+                "HERMES_KANBAN_WORKSPACE": "/workspace/project",
+            },
+        ):
+            result = _run_single_child(
+                task_index=0,
+                goal="Inspect CI",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(observed["HERMES_KANBAN_TASKLESS"], "1")
+        self.assertEqual(
+            observed["HERMES_KANBAN_WORKSPACE"], "/workspace/project"
+        )
+        self.assertNotIn("HERMES_KANBAN_TASK", observed)
+        self.assertNotIn("HERMES_KANBAN_RUN_ID", observed)
+        self.assertNotIn("HERMES_KANBAN_DB", observed)
 
 
 class TestDelegateHeartbeat(unittest.TestCase):

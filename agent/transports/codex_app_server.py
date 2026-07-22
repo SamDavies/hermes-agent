@@ -73,7 +73,7 @@ class CodexAppServerClient:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
-        env: Optional[dict[str, str]] = None,
+        env: Optional[dict[str, Optional[str]]] = None,
     ) -> None:
         self._codex_bin = codex_bin
         # codex app-server is a model-driving CLI executor: it runs a
@@ -89,16 +89,32 @@ class CodexAppServerClient:
         # (#29157 sibling spawn-site gap).
         spawn_env = hermes_subprocess_env(inherit_credentials=True)
         if env:
-            spawn_env.update(env)
+            for name, value in env.items():
+                if value is None:
+                    spawn_env.pop(name, None)
+                else:
+                    spawn_env[name] = value
+        from agent.kanban_scope import apply_taskless_kanban_subprocess_env
+        apply_taskless_kanban_subprocess_env(spawn_env)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
         app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to
-        # the board DB, which lives outside the per-task workspace. Keep the
-        # Codex sandbox on, but add the Kanban root as the only extra writable
-        # root. Without this, codex-runtime workers finish their actual work
-        # but crash/block when kanban_complete/kanban_block writes SQLite.
+        taskless_kanban_scope = spawn_env.get("HERMES_KANBAN_TASKLESS") == "1"
+        # Codex workers edit the project under workspace-write with network
+        # access off. The lifecycle-owning parent also receives the Kanban DB
+        # root for its terminal handoff; delegated agents return work through
+        # that parent while keeping full project write capability.
+        if spawn_env.get("HERMES_KANBAN_TASK") or taskless_kanban_scope:
+            app_server_args.extend(
+                [
+                    "-c",
+                    'sandbox_mode="workspace-write"',
+                    "-c",
+                    "sandbox_workspace_write.network_access=false",
+                ]
+            )
+
         if spawn_env.get("HERMES_KANBAN_TASK"):
             kanban_db = spawn_env.get("HERMES_KANBAN_DB")
             kanban_root = (
@@ -115,11 +131,7 @@ class CodexAppServerClient:
             app_server_args.extend(
                 [
                     "-c",
-                    'sandbox_mode="workspace-write"',
-                    "-c",
                     f'sandbox_workspace_write.writable_roots=["{kanban_root}"]',
-                    "-c",
-                    "sandbox_workspace_write.network_access=false",
                 ]
             )
 

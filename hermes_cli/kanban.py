@@ -912,6 +912,15 @@ def kanban_command(args: argparse.Namespace) -> int:
 
     Returns a shell-style exit code (0 on success, non-zero on error).
     """
+    from agent.kanban_scope import is_taskless_kanban_scope
+    if is_taskless_kanban_scope():
+        print(
+            "kanban: delegated work returns through its parent orchestrator, "
+            "which owns board lifecycle updates",
+            file=sys.stderr,
+        )
+        return 2
+
     action = getattr(args, "kanban_action", None)
     if not action:
         # No subaction given: print help via the stored parser reference.
