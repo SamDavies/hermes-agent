@@ -318,6 +318,20 @@ class TestCLI:
         assert data[0]["is_current"] is True
 
 
+    def test_worker_board_management_fails_cleanly(self, tmp_path):
+        env = {
+            "HERMES_HOME": str(tmp_path),
+            "HERMES_KANBAN_TASK": "t_worker",
+            "HERMES_KANBAN_RUN_ID": "1",
+            "HERMES_KANBAN_CLAIM_LOCK": "host:claim",
+        }
+        res = _cli(["boards", "create", "forbidden"], env_extra=env)
+        assert res.returncode == 1
+        assert "board management refused" in res.stderr
+        assert "Traceback" not in res.stderr
+        assert not (tmp_path / "kanban" / "boards" / "forbidden").exists()
+
+
     def test_per_board_task_isolation_via_cli(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
@@ -341,6 +355,5 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
-
 
 

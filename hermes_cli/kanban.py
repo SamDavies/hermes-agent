@@ -992,7 +992,11 @@ def kanban_command(args: argparse.Namespace) -> int:
     # reports beta as the current board even when the on-disk pointer is
     # alpha.
     if action == "boards":
-        return _dispatch_boards(args)
+        try:
+            return _dispatch_boards(args)
+        except (ValueError, RuntimeError, PermissionError) as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
 
     # `--board <slug>` applies to every subcommand below by way of an
     # env-var pin for the duration of this call. Using HERMES_KANBAN_BOARD
@@ -1091,7 +1095,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 2
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, PermissionError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
 
