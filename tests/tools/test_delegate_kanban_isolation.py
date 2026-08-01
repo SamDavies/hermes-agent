@@ -51,12 +51,18 @@ def _make_running_kanban_task(monkeypatch, tmp_path):
         )
         claim = kb.claim_task(conn, tid)
         assert claim is not None
-        run_id = claim.id
+        current = kb.get_task(conn, tid)
+        assert current is not None
+        assert current.current_run_id is not None
+        assert current.claim_lock
+        run_id = current.current_run_id
+        claim_lock = current.claim_lock
     finally:
         conn.close()
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claim_lock)
     return kb, tid, workspace, attachments_root
 
 
@@ -178,7 +184,11 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
         monkeypatch,
         tmp_path,
     )
-    kb.create_board("victim")
+    with monkeypatch.context() as operator:
+        operator.delenv("HERMES_KANBAN_TASK")
+        operator.delenv("HERMES_KANBAN_RUN_ID")
+        operator.delenv("HERMES_KANBAN_CLAIM_LOCK")
+        kb.create_board("victim")
     assert kb.board_exists("victim")
 
     from agent.delegation_context import delegated_child_context
@@ -201,10 +211,16 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
                 timeout=15,
             )
         assert kb.board_exists("victim")
-        parent_result = env.execute(
-            _python_with_repo_path(code),
-            timeout=15,
-        )
+        # Board topology is operator-only. Clear the dispatcher worker tuple
+        # as well as the delegated-child marker for the authorized control.
+        with monkeypatch.context() as operator:
+            operator.delenv("HERMES_KANBAN_TASK")
+            operator.delenv("HERMES_KANBAN_RUN_ID")
+            operator.delenv("HERMES_KANBAN_CLAIM_LOCK")
+            parent_result = env.execute(
+                _python_with_repo_path(code),
+                timeout=15,
+            )
     finally:
         env.cleanup()
 

@@ -33,10 +33,15 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        assert kb.claim_task(conn, tid)
+        current = kb.get_task(conn, tid)
+        assert current.current_run_id is not None
+        assert current.claim_lock
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", current.claim_lock)
     return tid
 
 

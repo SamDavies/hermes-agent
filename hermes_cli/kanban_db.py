@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import os
@@ -138,6 +139,28 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+@dataclass
+class _WorkerTerminalMutationLease:
+    """One validated worker run allowed to finish its own terminal transition.
+
+    Terminal helpers can perform housekeeping transactions after ending the
+    task's run. Those writes are part of the same authorized transition, so the
+    first transaction validates live ownership and the remaining transactions
+    reuse this process-local lease. Ordinary mutations never receive a lease
+    and must prove live ownership for every transaction.
+    """
+
+    task_id: str
+    run_id_raw: str
+    claim_lock: str
+    validated: bool = False
+
+
+_WORKER_TERMINAL_MUTATION_LEASE: ContextVar[
+    Optional[_WorkerTerminalMutationLease]
+] = ContextVar("kanban_worker_terminal_mutation_lease", default=None)
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
@@ -159,6 +182,194 @@ def _assert_not_delegated_child_mutation() -> None:
         raise PermissionError(
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )
+
+
+def _assert_operator_board_mutation() -> None:
+    """Keep board topology changes out of dispatcher worker processes.
+
+    A worker's authority is scoped to task rows on the board pinned by the
+    dispatcher. Creating, switching, editing, or removing whole boards is an
+    operator/orchestrator action. Unlike a SQLite transaction, these
+    filesystem writes cannot be rolled back if a worker is reclaimed midway.
+    """
+
+    _assert_not_delegated_child_mutation()
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if task_id:
+        raise PermissionError(
+            "Kanban board management refused: dispatcher workers are scoped "
+            f"to tasks on their pinned board (worker task {task_id})"
+        )
+
+
+def _assert_operator_recovery_mutation(action: str) -> None:
+    """Keep process-control recovery actions out of worker processes."""
+
+    _assert_not_delegated_child_mutation()
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if task_id:
+        raise PermissionError(
+            f"Kanban {action} refused: dispatcher workers cannot perform "
+            f"operator recovery actions (worker task {task_id})"
+        )
+
+
+def _assert_live_worker_mutation(conn: sqlite3.Connection) -> None:
+    """Fence mutations from dispatcher workers whose run is no longer live.
+
+    A reclaimed or archived worker process can outlive its board run briefly.
+    Its inherited task/run/claim tuple is authority only while the exact task
+    still points at that open running run.  Validate under the same
+    ``BEGIN IMMEDIATE`` lock as the pending write so reclaim/archive cannot race
+    between the check and mutation.  Operator/orchestrator processes do not
+    carry ``HERMES_KANBAN_TASK`` and remain unrestricted.
+    """
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return
+
+    run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "")
+    lease = _WORKER_TERMINAL_MUTATION_LEASE.get()
+    if lease is not None:
+        if (
+            lease.task_id != task_id
+            or lease.run_id_raw != run_id_raw
+            or lease.claim_lock != claim_lock
+        ):
+            raise PermissionError(
+                "Kanban mutation refused: worker authority changed during its "
+                "terminal transition"
+            )
+        if lease.validated:
+            return
+
+    if not run_id_raw and not claim_lock:
+        # Legacy/local task-scoped sessions predate dispatcher run authority.
+        # They may keep working only while the task's current run is itself
+        # live; unlike dispatcher workers they cannot prove an exact claim
+        # generation, so any terminal/reclaimed state still fails closed.
+        try:
+            legacy = conn.execute(
+                """
+                SELECT t.status AS task_status,
+                       t.current_run_id,
+                       r.status AS run_status,
+                       r.ended_at AS run_ended_at
+                  FROM tasks t
+                  LEFT JOIN task_runs r ON r.id = t.current_run_id
+                 WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise PermissionError(
+                "Kanban mutation refused: local worker ownership could not be "
+                "verified on this board"
+            ) from exc
+        if not (
+            legacy
+            and legacy["task_status"] == "running"
+            and legacy["current_run_id"] is not None
+            and legacy["run_status"] == "running"
+            and legacy["run_ended_at"] is None
+        ):
+            raise PermissionError(
+                f"Kanban mutation refused: worker task {task_id} no longer "
+                "owns a live run"
+            )
+        if lease is not None:
+            lease.validated = True
+        return
+    try:
+        run_id = int(run_id_raw)
+    except (TypeError, ValueError):
+        run_id = 0
+    if run_id <= 0 or not claim_lock:
+        raise PermissionError(
+            "Kanban mutation refused: dispatcher worker is missing its trusted "
+            "HERMES_KANBAN_RUN_ID/HERMES_KANBAN_CLAIM_LOCK authority"
+        )
+
+    try:
+        row = conn.execute(
+            """
+            SELECT t.status AS task_status,
+                   t.current_run_id,
+                   t.claim_lock AS task_claim_lock,
+                   r.task_id AS run_task_id,
+                   r.status AS run_status,
+                   r.ended_at AS run_ended_at,
+                   r.claim_lock AS run_claim_lock
+              FROM tasks t
+              LEFT JOIN task_runs r
+                ON r.id = ? AND r.task_id = t.id
+             WHERE t.id = ?
+            """,
+            (run_id, task_id),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise PermissionError(
+            "Kanban mutation refused: worker run ownership could not be "
+            "verified on this board"
+        ) from exc
+
+    live = bool(
+        row
+        and row["task_status"] == "running"
+        and row["current_run_id"] == run_id
+        and row["task_claim_lock"] == claim_lock
+        and row["run_task_id"] == task_id
+        and row["run_status"] == "running"
+        and row["run_ended_at"] is None
+        and row["run_claim_lock"] == claim_lock
+    )
+    if not live:
+        state = "missing"
+        if row:
+            state = (
+                f"status={row['task_status']}, "
+                f"current_run_id={row['current_run_id']}, "
+                f"run_status={row['run_status']}, "
+                f"run_ended_at={row['run_ended_at']}"
+            )
+        raise PermissionError(
+            f"Kanban mutation refused: worker task {task_id} no longer owns "
+            f"active run {run_id} ({state})"
+        )
+
+    if lease is not None:
+        lease.validated = True
+
+
+def _with_worker_terminal_mutation_lease(func):
+    """Let a validated own-task transition finish its follow-up writes."""
+
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        task_id = os.environ.get("HERMES_KANBAN_TASK")
+        target_task_id = kwargs.get("task_id")
+        if target_task_id is None and len(args) > 1:
+            target_task_id = args[1]
+        if (
+            not task_id
+            or target_task_id != task_id
+            or _WORKER_TERMINAL_MUTATION_LEASE.get() is not None
+        ):
+            return func(*args, **kwargs)
+        lease = _WorkerTerminalMutationLease(
+            task_id=task_id,
+            run_id_raw=os.environ.get("HERMES_KANBAN_RUN_ID", ""),
+            claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK", ""),
+        )
+        token = _WORKER_TERMINAL_MUTATION_LEASE.set(lease)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _WORKER_TERMINAL_MUTATION_LEASE.reset(token)
+
+    return wrapped
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -491,7 +702,7 @@ def set_current_board(slug: str) -> Path:
     so that ``hermes kanban boards switch <typo>`` returns an error
     instead of silently pointing at nothing.
     """
-    _assert_not_delegated_child_mutation()
+    _assert_operator_board_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -503,7 +714,7 @@ def set_current_board(slug: str) -> Path:
 
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
-    _assert_not_delegated_child_mutation()
+    _assert_operator_board_mutation()
     try:
         current_board_path().unlink()
     except FileNotFoundError:
@@ -716,7 +927,7 @@ def write_board_metadata(
     project scope; a value sets it (not validated here — the caller resolves
     it against ``projects_db``).
     """
-    _assert_not_delegated_child_mutation()
+    _assert_operator_board_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
     # Preserve existing DB-derived fields — they get re-computed each
@@ -836,7 +1047,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     Returns a summary dict describing what happened (``{"slug", "action",
     "new_path"}``).
     """
-    _assert_not_delegated_child_mutation()
+    _assert_operator_board_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -2765,6 +2976,7 @@ def write_txn(conn: sqlite3.Connection):
     _assert_not_delegated_child_mutation()
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
+        _assert_live_worker_mutation(conn)
         yield conn
     except Exception:
         try:
@@ -4521,6 +4733,11 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    # Reclaim can signal a process before its DB write. It is therefore an
+    # operator-only recovery primitive: reject worker contexts before even
+    # reading the target, while preserving the established signal-outside-lock
+    # operator path so a wedged worker holding SQLite's write lock can be killed.
+    _assert_operator_recovery_mutation("reclaim")
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
@@ -4591,6 +4808,7 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    _assert_operator_recovery_mutation("reassign")
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -4739,6 +4957,7 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+@_with_worker_terminal_mutation_lease
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6194,6 +6413,7 @@ def decompose_triage_task(
     return child_ids
 
 
+@_with_worker_terminal_mutation_lease
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
