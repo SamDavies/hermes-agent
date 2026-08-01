@@ -393,6 +393,8 @@ def _cwd_marker(session_id: str) -> str:
 #   child's scrubbed process; and
 # * a child's ``HERMES_DELEGATED_CHILD_CONTEXT`` marker can be restored inside
 #   the parent process after delegation returns.
+# * the fresh sanitizer Bash increments exported ``SHLVL`` before dumping it,
+#   so persisting that shell-maintained value ratchets it on every command.
 #
 # Session variables are bridged by
 # tools/environments/local._inject_session_context_env. Delegated-child and
@@ -403,12 +405,15 @@ def _cwd_marker(session_id: str) -> str:
 #
 # The session subset is kept in sync with gateway.session_context._VAR_MAP;
 # Kanban ownership and delegated-child lineage are the additional command-local
-# authority classes. Used by unit tests as the Python-side contract for the
-# exclusion set; the dump path unsets by name/prefix instead of grepping declare
-# lines (see below / issue #71296).
+# authority classes. ``SHLVL`` is also excluded because each command already
+# starts at a stable process depth; it is not user-owned session state. Used by
+# unit tests as the Python-side contract for the exclusion set; the dump path
+# unsets by name/prefix instead of grepping declare lines (see below / issue
+# #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|"
-    "HERMES_CRON_AUTO_DELIVER_|HERMES_KANBAN_|HERMES_DELEGATED_CHILD_CONTEXT)"
+    "HERMES_CRON_AUTO_DELIVER_|HERMES_KANBAN_|HERMES_DELEGATED_CHILD_CONTEXT|"
+    "SHLVL)"
 )
 
 
@@ -418,7 +423,8 @@ def _export_dump_excluding_session_vars(
     trusted_bash: str = '"$BASH"',
 ) -> str:
     """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus
-    Hermes' command-scoped authority vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+    Hermes' command-scoped authority vars and shell-maintained ``SHLVL`` (see
+    ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
 
     Unset the bridged vars in a subshell *before* ``export -p``. A line-based
     ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
@@ -451,11 +457,11 @@ def _export_dump_excluding_session_vars(
     dump_script = (
         'builtin export -n "${!HERMES_SESSION_@}" '
         '"${!HERMES_CRON_AUTO_DELIVER_@}" "${!HERMES_KANBAN_@}" '
-        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT "
+        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT SHLVL "
         "2>/dev/null || true; "
         'builtin unset "${!HERMES_SESSION_@}" '
         '"${!HERMES_CRON_AUTO_DELIVER_@}" "${!HERMES_KANBAN_@}" '
-        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT "
+        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT SHLVL "
         "2>/dev/null || true; "
         "builtin export -p"
     )

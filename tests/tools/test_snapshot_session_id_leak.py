@@ -46,6 +46,7 @@ def test_regex_matches_bridged_session_vars():
         "HERMES_KANBAN_DB",
         "HERMES_KANBAN_CLAIM_LOCK",
         "HERMES_DELEGATED_CHILD_CONTEXT",
+        "SHLVL",
     ):
         line = f'declare -x {name}="whatever"'
         assert rx.search(line), f"{name} should be excluded from the snapshot"
@@ -62,6 +63,7 @@ def test_export_snippet_shape():
     assert '"${!HERMES_KANBAN_@}"' in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
     assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
+    assert "SHLVL" in snippet
     assert "builtin export -n" in snippet
     assert snippet.index("builtin export -n") < snippet.index("builtin unset")
     assert "builtin export -p" in snippet
@@ -135,13 +137,17 @@ def test_shared_snapshot_preserves_parent_child_kanban_boundary(monkeypatch, tmp
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
 
     command = (
-        "printf '%s|%s\\n' "
+        "printf '%s|%s|%s|%s\\n' "
         '"${HERMES_KANBAN_TASK-unset}" '
-        '"${HERMES_DELEGATED_CHILD_CONTEXT-unset}"'
+        '"${HERMES_DELEGATED_CHILD_CONTEXT-unset}" '
+        '"${SNAPSHOT_CANARY-unset}" '
+        '"${SHLVL-unset}"'
     )
     env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
     try:
-        parent_before = env.execute(command)["output"]
+        parent_before = env.execute(
+            "export SNAPSHOT_CANARY=kept; " + command
+        )["output"]
         readonly_result = env.execute(
             "IFS=_; export HERMES_KANBAN_TASK=t_readonly; "
             "readonly HERMES_KANBAN_TASK; "
@@ -155,11 +161,25 @@ def test_shared_snapshot_preserves_parent_child_kanban_boundary(monkeypatch, tmp
             child = env.execute(command)["output"]
         parent_after = env.execute(command)["output"]
 
-        assert "t_parent|unset" in parent_before
-        assert "unset|1" in child
-        assert "t_parent|unset" in parent_after
+        parent_before_state = re.search(
+            r"t_parent\|unset\|kept\|(\d+)", parent_before
+        )
+        child_state = re.search(r"unset\|1\|kept\|(\d+)", child)
+        parent_after_state = re.search(
+            r"t_parent\|unset\|kept\|(\d+)", parent_after
+        )
+        assert parent_before_state, parent_before
+        assert child_state, child
+        assert parent_after_state, parent_after
+        assert {
+            parent_before_state.group(1),
+            child_state.group(1),
+            parent_after_state.group(1),
+        } == {parent_before_state.group(1)}
 
         snapshot = open(env._snapshot_path, encoding="utf-8").read()
+        assert 'declare -x SNAPSHOT_CANARY="kept"' in snapshot
+        assert not re.search(r"^declare -x SHLVL=", snapshot, re.MULTILINE)
         assert "HERMES_KANBAN_" not in snapshot
         assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snapshot
     finally:
